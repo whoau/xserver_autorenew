@@ -1,0 +1,44 @@
+name: Auto Extend EternalZero Panel
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"   # 每 2 小时运行一次（UTC）
+  workflow_dispatch: {}     # 允许手动触发
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Run renew script
+        env:
+          FG_LOGIN_METHOD: ${{ secrets.FG_LOGIN_METHOD || 'AUTO' }}  # AUTO：优先 Cookie，失败再邮箱
+          FG_COOKIE: ${{ secrets.FG_COOKIE }}                         # 可选
+          FG_EMAIL: ${{ secrets.FG_EMAIL }}                           # 可选
+          FG_PASSWORD: ${{ secrets.FG_PASSWORD }}                     # 可选
+          FG_SERVER_KEYWORD: "null's Test Server"
+          FG_BASE_URL: https://gpanel.eternalzero.cloud
+          FG_COOKIE_DOMAIN: gpanel.eternalzero.cloud
+          HEADLESS: "true"
+          TIMEOUT_MS: "30000"
+        run: |
+          python renew_eternalzero.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots
