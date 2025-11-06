@@ -2,13 +2,17 @@ name: XServerGAMEs Auto Renew
 
 on:
   schedule:
-    # 每两天（UTC 00:00）执行一次。注意：按日历每两天，不是严格 48 小时。
     - cron: "0 0 */2 * *"
   workflow_dispatch:
+
+permissions:
+  contents: write   # 允许提交变更
 
 jobs:
   renew:
     runs-on: ubuntu-latest
+    env:
+      RENEW_LOG_MD: renew_result.md  # 日志文件名，可改
 
     steps:
       - name: Checkout
@@ -30,16 +34,26 @@ jobs:
           XSERVER_EMAIL: ${{ secrets.XSERVER_EMAIL }}
           XSERVER_PASSWORD: ${{ secrets.XSERVER_PASSWORD }}
           XSERVER_COOKIE: ${{ secrets.XSERVER_COOKIE }}
-          TARGET_GAME: ${{ secrets.TARGET_GAME }} # 可选
+          TARGET_GAME: ${{ secrets.TARGET_GAME }}
           HEADLESS: "1"
           PLAYWRIGHT_TIMEOUT_MS: "15000"
+          RENEW_LOG_MD: ${{ env.RENEW_LOG_MD }}
         run: |
           python xserver_autorenew.py
 
-      - name: Upload screenshots (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots
-          path: screenshots
-          if-no-files-found: ignore
+      - name: Commit renewal log (if updated)
+        if: always()     # 即使前一步失败也检查是否有成功日志
+        run: |
+          FILE="${{ env.RENEW_LOG_MD }}"
+          if [ -f "$FILE" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$FILE"
+            if git diff --cached --quiet; then
+              echo "No changes to commit."
+            else
+              git commit -m "chore: update renewal log [skip ci]"
+              git push
+            fi
+          else
+            echo "No log file to commit."
