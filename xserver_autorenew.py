@@ -428,3 +428,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+success = do_extend_72h(page)
+
+if success:
+    # 写入 md（默认文件名 renew_result.md，可通过环境变量覆盖）
+    write_success_md(os.getenv("RENEW_LOG_MD", "renew_result.md"))
+    log("All steps completed.")
+else:
+    log("Extension step reported failure.")
