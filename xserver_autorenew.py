@@ -27,6 +27,9 @@ TARGET_GAME = os.getenv("TARGET_GAME", "").strip()
 # 页面上选择的续期时长
 RENEW_HOURS = int(os.getenv("RENEW_HOURS", "72"))
 
+# 触发续期的阈值时间 (小于这个小时数才触发续期)
+RENEW_THRESHOLD_HOURS = int(os.getenv("RENEW_THRESHOLD_HOURS", "24"))
+
 # 日志文件与时区
 RENEW_LOG_MD = os.getenv("RENEW_LOG_MD", "renew_result.md")
 LOG_TIMEZONE = os.getenv("LOG_TIMEZONE", "Asia/Tokyo")
@@ -45,13 +48,14 @@ def ensure_dir(p: Path):
 
 
 def snap(page, name: str):
+    """通用截图函数，保存在 screenshots 文件夹下"""
     try:
         out = Path("screenshots")
         ensure_dir(out)
         safe_name = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", name)
         filepath = out / f"{int(time.time())}_{safe_name}.png"
         page.screenshot(path=str(filepath), full_page=True)
-        log(f"Saved screenshot: {filepath}")
+        log(f"📸 Saved screenshot: {filepath}")
     except Exception as e:
         log(f"Screenshot failed: {e}")
 
@@ -184,7 +188,6 @@ def scroll_to_bottom(page):
 
 
 def accept_required_checks(page):
-    """仅勾选包含同意/確認/承諾等关键词的复选框，避免盲勾危险选项。"""
     agree_keywords = ["同意", "確認", "承諾", "同意します", "確認しました", "規約", "注意事項"]
 
     for k in agree_keywords:
@@ -247,7 +250,7 @@ def click_submit_fallback(page):
 
 
 # ------------------ Logging to .md ------------------
-def write_success_md(filepath=RENEW_LOG_MD, tzname=LOG_TIMEZONE):
+def write_status_md(status_text: str, filepath=RENEW_LOG_MD, tzname=LOG_TIMEZONE):
     tz = None
     try:
         tz = ZoneInfo(tzname) if ZoneInfo else None
@@ -255,10 +258,10 @@ def write_success_md(filepath=RENEW_LOG_MD, tzname=LOG_TIMEZONE):
         tz = None
     now = datetime.now(tz) if tz else datetime.now(timezone.utc)
     suffix = tzname if tz else "UTC"
-    line = f"{now.strftime('%Y-%m-%d %H:%M:%S')} {suffix} 成功\n"
+    line = f"{now.strftime('%Y-%m-%d %H:%M:%S')} {suffix} {status_text}\n"
     with open(filepath, "a", encoding="utf-8") as f:
         f.write(line)
-    log(f"[write_success_md] {line.strip()} -> {filepath}")
+    log(f"[MD Log] {line.strip()} -> {filepath}")
 
 
 # ------------------ Auth ------------------
@@ -278,13 +281,11 @@ def cookie_login(context, page) -> bool:
         return False
 
     goto(page, GAME_INDEX_URL)
-    snap(page, "after_cookie_goto_game_index")
     if is_logged_in(page):
         log("Logged in via cookie (game index).")
         return True
 
     goto(page, LOGIN_URL)
-    snap(page, "after_cookie_goto_login")
     if is_logged_in(page):
         log("Logged in via cookie (login URL).")
         return True
@@ -296,7 +297,6 @@ def password_login(page) -> bool:
     if not EMAIL or not PASSWORD:
         return False
     goto(page, LOGIN_URL)
-    snap(page, "login_form_loaded")
 
     filled_email = False
     for label in ["メールアドレス", "ログインID", "アカウントID", "ID", "メール"]:
@@ -356,22 +356,12 @@ def password_login(page) -> bool:
         page.wait_for_load_state("load", timeout=DEFAULT_TIMEOUT)
     except Exception:
         pass
-    snap(page, "after_login_submit")
     return is_logged_in(page)
 
 
-# ------------------ Navigation ------------------
-UPGRADE_TEXTS = [
-    "アップグレード・期限延長", "アップグレード/期限延長", "アップグレード ・ 期限延長",
-    "期限延長", "期限を延長する", "更新", "更新手続き",
-    "プラン変更・期限延長", "プラン変更",
-]
-DETAIL_TEXTS = ["詳細", "管理", "設定", "ゲーム詳細", "サービス詳細", "契約情報", "メニュー"]
-CONTRACT_TEXTS = ["契約", "契約情報", "料金", "お支払い", "支払い", "請求", "更新", "延長", "プラン変更"]
-
+# ------------------ Navigation & Check ------------------
 def navigate_to_game_management(page) -> bool:
     goto(page, GAME_INDEX_URL)
-    snap(page, "on_game_index")
 
     def click_row_btn(row) -> bool:
         selectors = [
@@ -392,7 +382,6 @@ def navigate_to_game_management(page) -> bool:
         try:
             row = page.locator("tbody tr").filter(has_text=TARGET_GAME)
             if row.count() > 0 and click_row_btn(row.first):
-                snap(page, "clicked_row_game_management_target")
                 try:
                     page.wait_for_load_state("load", timeout=DEFAULT_TIMEOUT)
                 except Exception:
@@ -409,7 +398,6 @@ def navigate_to_game_management(page) -> bool:
             loc = page.locator(sel)
             if loc.count() > 0 and loc.first.is_visible():
                 if try_click(page, loc.first, timeout=1500):
-                    snap(page, "clicked_row_game_management_first")
                     try:
                         page.wait_for_load_state("load", timeout=DEFAULT_TIMEOUT)
                     except Exception:
@@ -424,7 +412,6 @@ def navigate_to_game_management(page) -> bool:
         n = min(cnt if cnt else 0, 10)
         for i in range(n):
             if click_row_btn(rows.nth(i)):
-                snap(page, f"clicked_row_game_management_index_{i}")
                 try:
                     page.wait_for_load_state("load", timeout=DEFAULT_TIMEOUT)
                 except Exception:
@@ -433,10 +420,58 @@ def navigate_to_game_management(page) -> bool:
     except Exception:
         pass
 
-    log("Row-level 'ゲーム管理' button not found on list page.")
     return False
 
-def open_game_detail(page) -> bool:
+
+def should_extend_based_on_time(page, threshold_hours: int) -> bool:
+    """时间判断函数（包含截图留证）"""
+    log(f"Checking if remaining time is less than {threshold_hours}h...")
+    page.wait_for_timeout(1500) 
+    
+    try:
+        body_text = page.locator("body").inner_text()
+        
+        # 匹配小时
+        match = re.search(r'残り\s*(\d+)\s*時間', body_text)
+        if match:
+            hours = int(match.group(1))
+            log(f"🕒 Found remaining time: {hours} hours.")
+            
+            # 📸 拍下当前剩余时间的画面
+            snap(page, f"time_check_{hours}h_remaining")
+            
+            if hours < threshold_hours:
+                log(f"✅ {hours}h < {threshold_hours}h. Will proceed.")
+                return True
+            else:
+                log(f"🛑 {hours}h >= {threshold_hours}h. Time is sufficient, skipping.")
+                return False
+                
+        # 匹配不足1小时的分钟
+        match_min = re.search(r'残り\s*(\d+)\s*分', body_text)
+        if match_min and "時間" not in body_text and "日" not in body_text:
+            mins = int(match_min.group(1))
+            log(f"🕒 Found remaining time: {mins} minutes.")
+            
+            # 📸 拍下剩余分钟的画面
+            snap(page, f"time_check_{mins}m_remaining")
+            return True
+            
+        # 解析失败兜底
+        log("⚠️ Could not find '残りXX時間'. Defaulting to proceed.")
+        snap(page, "time_check_failed_to_parse")
+        return True
+
+    except Exception as e:
+        log(f"⚠️ Error parsing remaining time: {e}. Defaulting to proceed.")
+        snap(page, "time_check_error")
+        return True
+
+
+def click_upgrade_or_extend(page) -> bool:
+    if click_text_global(page, UPGRADE_TEXTS):
+        return True
+
     try:
         if TARGET_GAME:
             loc = page.locator(f'text={TARGET_GAME}')
@@ -445,36 +480,27 @@ def open_game_detail(page) -> bool:
                 parent = container.locator('xpath=ancestor::*[self::tr or contains(@class,"card") or contains(@class,"item")][1]')
                 for t in DETAIL_TEXTS:
                     if try_click(page, parent.locator(f'text={t}')) or try_click(page, container.locator(f'text={t}')):
-                        return True
-        if click_text_global(page, DETAIL_TEXTS):
-            return True
+                        pass
+        click_text_global(page, DETAIL_TEXTS)
     except Exception:
         pass
-    return False
 
-def click_upgrade_or_extend(page) -> bool:
+    try:
+        page.wait_for_load_state("load", timeout=DEFAULT_TIMEOUT)
+    except Exception:
+        pass
+
     if click_text_global(page, UPGRADE_TEXTS):
-        snap(page, "after_click_upgrade_extend")
         return True
 
-    if open_game_detail(page):
+    if click_text_global(page, CONTRACT_TEXTS):
         try:
             page.wait_for_load_state("load", timeout=DEFAULT_TIMEOUT)
         except Exception:
             pass
-        snap(page, "after_open_detail")
         if click_text_global(page, UPGRADE_TEXTS):
             return True
-        if click_text_global(page, CONTRACT_TEXTS):
-            try:
-                page.wait_for_load_state("load", timeout=DEFAULT_TIMEOUT)
-            except Exception:
-                pass
-            if click_text_global(page, UPGRADE_TEXTS):
-                return True
 
-    snap(page, "open_upgrade_extend_failed")
-    dump_html(page, "open_upgrade_extend_failed")
     return False
 
 # ------------------ Extend ------------------
@@ -503,37 +529,31 @@ def select_hours(page, hours: int) -> bool:
 
 
 def do_extend_hours(page, hours: int) -> bool:
-    """执行续期操作。"""
     scroll_to_bottom(page)
     click_text_global(page, ["期限を延長する", "延長する"])
     try:
         page.wait_for_load_state("load", timeout=DEFAULT_TIMEOUT)
     except Exception:
         pass
-    snap(page, "after_click_entry_extend")
 
     if not select_hours(page, hours):
-        log(f"Could not select +{hours}時間 option. Aborting to avoid wrong duration.")
+        log(f"Could not select +{hours}時間 option. Aborting.")
         snap(page, f"failed_select_{hours}h")
-        dump_html(page, f"failed_select_{hours}h")
         return False
-    snap(page, f"selected_{hours}h")
 
     accept_required_checks(page)
 
     if not click_text_global(page, ["確認画面に進む", "確認へ進む", "確認画面へ", "確認"]):
-        log("Could not find 確認画面に進む. Maybe already on confirm page.")
+        log("Could not find 確認画面に進む.")
     else:
         try:
             page.wait_for_load_state("load", timeout=DEFAULT_TIMEOUT)
         except Exception:
             pass
-    snap(page, "after_go_confirm")
 
     scroll_to_bottom(page)
     accept_required_checks(page)
 
-    # 最终提交
     final_texts = [
         "期限を延長する", "延長する", "実行する",
         "延長を確定する", "確定する",
@@ -542,20 +562,13 @@ def do_extend_hours(page, hours: int) -> bool:
     ]
     if not click_text_global(page, final_texts):
         if not click_submit_fallback(page):
-            log("Could not find the final submit button.")
             snap(page, "failed_final_extend_click")
-            dump_html(page, "failed_final_extend_click")
             return False
 
     log("Final submit button clicked, waiting for result...")
-    snap(page, "after_extend_submit_clicked")
     
-    # === 修复的逻辑开始 ===
-    
-    # 1. 给页面一点时间处理提交跳转 (防止瞬间检测到老页面)
     page.wait_for_timeout(2000) 
     
-    # 2. 拦截并检查是否有明显的报错信息
     error_keywords = [
         "エラー", "失敗", "不足", "できません", "無効", 
         "残高が不足", "同意してください"
@@ -566,12 +579,10 @@ def do_extend_hours(page, hours: int) -> bool:
             if err_loc.is_visible(timeout=500):
                 log(f"🚨 Failed: Detected error message on page: '{err}'")
                 snap(page, "extend_error_detected")
-                dump_html(page, "extend_error_detected")
                 return False
         except Exception:
             pass
 
-    # 3. 严格的成功判定 (严禁匹配导航栏或页脚等无关区域)
     success_keywords = [
         "完了", "処理が完了", "更新されました",
         "受け付けました", "受付しました", "手続きが完了",
@@ -580,19 +591,16 @@ def do_extend_hours(page, hours: int) -> bool:
     is_success = False
     for t in success_keywords:
         try:
-            # 优先寻找页面大标题或独立段落中的成功提示语，强制等待它出现（最多10秒）
             loc = page.locator(f'h1:has-text("{t}"), h2:has-text("{t}"), h3:has-text("{t}"), div.complete-message:has-text("{t}"), p:has-text("{t}")').first
             loc.wait_for(state="visible", timeout=10000)
             log(f"✅ Extension succeeded (Strictly detected: '{t}').")
             is_success = True
             break
         except Exception:
-            # 兜底：全局寻找，但过滤掉包含 nav 和 footer 的标签
             try:
                 fallback_loc = page.get_by_text(t, exact=False).first
                 fallback_loc.wait_for(state="visible", timeout=5000)
                 
-                # 获取该元素的 HTML，检查它是不是处于导航栏
                 html_snippet = fallback_loc.evaluate("el => el.outerHTML", timeout=2000)
                 if html_snippet and "nav" not in html_snippet.lower() and "footer" not in html_snippet.lower():
                     log(f"✅ Extension succeeded (Fallback detected: '{t}').")
@@ -602,23 +610,21 @@ def do_extend_hours(page, hours: int) -> bool:
                 pass
 
     if is_success:
-        snap(page, "extend_success_confirmed")
+        snap(page, "extend_success_confirmed") # 📸 续约成功的截图
         return True
 
-    # 4. 如果超时既没报错也没看到成功，认定为失败
     log("❌ No success message strictly detected after submission timeout.")
     snap(page, "no_success_message_timeout")
-    dump_html(page, "no_success_message_timeout")
     return False
 
 
 # ------------------ Main ------------------
 def main():
     if not COOKIE_STR and (not EMAIL or not PASSWORD):
-        log("No cookie provided and missing EMAIL/PASSWORD. Please set GitHub Secrets.")
+        log("No cookie provided and missing EMAIL/PASSWORD.")
         sys.exit(1)
 
-    rc = 1  # 默认失败
+    rc = 1  
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS,
@@ -636,7 +642,6 @@ def main():
             page = context.new_page()
             page.set_default_timeout(DEFAULT_TIMEOUT)
 
-            # ---------- 登录 ----------
             logged_in = False
             if COOKIE_STR:
                 log("Trying cookie login...")
@@ -647,31 +652,35 @@ def main():
 
             if not logged_in:
                 snap(page, "login_failed")
-                dump_html(page, "login_failed")
-                log("Login failed. Check credentials/cookie.")
+                log("Login failed.")
                 rc = 2
                 return  
 
-            # ---------- ゲーム管理 ----------
             log("Navigating to Game Management...")
             if not navigate_to_game_management(page):
-                log("Could not open ゲーム管理. Exiting.")
+                log("Could not open ゲーム管理.")
                 rc = 3
                 return
 
-            # ---------- アップグレード・期限延長 ----------
+            # ---------- 核心：时间校验拦截 ----------
+            if not should_extend_based_on_time(page, RENEW_THRESHOLD_HOURS):
+                # 📸 拍下跳过时的最后状态
+                snap(page, "skipped_sufficient_time")
+                write_status_md("跳过 (剩余时间充足)", RENEW_LOG_MD, LOG_TIMEZONE)
+                rc = 0
+                return
+
             log("Opening アップグレード・期限延長...")
             if not click_upgrade_or_extend(page):
-                log("Could not open upgrade/extend page. Exiting.")
+                log("Could not open upgrade/extend page.")
                 rc = 3
                 return
 
-            # ---------- 执行续期 ----------
             log(f"Performing +{RENEW_HOURS}h extension...")
             success = do_extend_hours(page, RENEW_HOURS)
 
             if success:
-                write_success_md(RENEW_LOG_MD, LOG_TIMEZONE)
+                write_status_md("成功", RENEW_LOG_MD, LOG_TIMEZONE)
                 log("All steps completed successfully.")
                 rc = 0
             else:
@@ -682,7 +691,6 @@ def main():
             log(f"Unexpected error: {e}")
             try:
                 snap(page, "unexpected_error")
-                dump_html(page, "unexpected_error")
             except Exception:
                 pass
             rc = 5
