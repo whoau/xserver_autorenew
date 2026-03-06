@@ -1,50 +1,75 @@
-name: XServerGAMEs Auto Renew (fast)
+name: XServer Auto Renew
 
 on:
+  workflow_dispatch: # 允许在 GitHub 网页上通过按钮手动触发测试
   schedule:
-    - cron: "0 0 */2 * *"   # 每两天（UTC）
-  workflow_dispatch:
-    inputs:
-      renew_hours:
-        description: "Renew hours on page (e.g., 72)"
-        required: false
-        default: "72"
-      target_game:
-        description: "Target game keyword (optional)"
-        required: false
-        default: ""
-      timezone:
-        description: "Log timezone (e.g., Asia/Tokyo, Asia/Shanghai)"
-        required: false
-        default: "Asia/Tokyo"
-
-permissions:
-  contents: write
+    # 定时任务：每天 UTC 时间 0点 和 12点 (对应北京时间 8:00 和 20:00，东京时间 9:00 和 21:00) 运行
+    # 建议一天跑两次，配合 24h 的阈值刚刚好
+    - cron: '0 0,12 * * *'
 
 jobs:
-  renew:
+  renew-server:
     runs-on: ubuntu-latest
-    env:
-      RENEW_LOG_MD: renew_result.md
-      PW_VER: "1.45.2"   # 固定版本便于命中缓存
+    
+    # 必须赋予写权限，以便脚本修改了 renew_result.md 后能推送到仓库
+    permissions:
+      contents: write
 
     steps:
-      - name: Checkout
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 🐍 Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip' # 开启 pip 缓存，加快后续运行速度
 
-      - name: Cache Playwright browsers
-        id: pw-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ms-playwright-${{ runner.os }}-v${{ env.PW_VER }}
-          restore-keys: |
-            ms-playwright-${{ runner.os }}-
-
-      - name: Install Playwright (pinned)
+      - name: 📦 Install Dependencies
         run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          # 只安装 Chromium 及其系统依赖，节省时间
+          playwright install chromium --with-deps
+
+      - name: 🚀 Run Auto Renew Script
+        env:
+          # 以下三个变量需要你去 GitHub 仓库的 Settings -> Secrets and variables -> Actions 中设置
+          XSERVER_EMAIL: ${{ secrets.XSERVER_EMAIL }}
+          XSERVER_PASSWORD: ${{ secrets.XSERVER_PASSWORD }}
+          XSERVER_COOKIE: ${{ secrets.XSERVER_COOKIE }}
+          
+          # 续期配置，你可以直接在这里修改
+          RENEW_HOURS: '72'              # 每次续费 72 小时
+          RENEW_THRESHOLD_HOURS: '24'    # 小于 24 小时才触发续费
+          TARGET_GAME: ''                # 若有多个服务器，填入名字匹配。为空则默认第一个
+          LOG_TIMEZONE: 'Asia/Tokyo'     # 日志里的时间显示时区
+
+        # 假设你的 Python 脚本文件名为 renew.py。如果不叫这个，请修改这里的名字
+        run: python renew.py 
+
+      - name: 📸 Upload Screenshots and Pages (Artifacts)
+        if: always() # 【关键】无论脚本成功、跳过还是失败，都会上传截图，方便你排错
+        uses: actions/upload-artifact@v4
+        with:
+          name: automation-screenshots
+          path: |
+            screenshots/
+            pages/
+          retention-days: 7 # 截图文件只保留 7 天，防止占用过多空间
+
+      - name: 📝 Commit and Push Log (renew_result.md)
+        if: always() # 无论成功还是跳过，只要日志有更新就提交
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          # 如果文件不存在则跳过，存在则 add
+          git add renew_result.md || true
+          
+          # 检查是否有变动，如果有变动才进行 commit 和 push，避免因为没有修改而报错
+          if ! git diff --staged --quiet; then
+            git commit -m "📝 update renew log"
+            git push
+          else
+            echo "No changes to commit."
+          fi
